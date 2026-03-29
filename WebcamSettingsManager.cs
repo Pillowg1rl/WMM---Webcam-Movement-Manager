@@ -6,6 +6,7 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.ComTypes;
 using System.Text;
+using System.Net;
 using System.Threading;
 using System.Windows.Forms;
 
@@ -16,6 +17,13 @@ using System.Windows.Forms;
 
 namespace WebcamSettingsManager
 {
+    static class AppInfo
+    {
+        public const string Version = "1.0.0";
+        public const string GitHubOwner = "Pillowg1rl";
+        public const string GitHubRepo = "WMM---Webcam-Movement-Manager";
+    }
+
     // ========================================================================
     // COM Interface Definitions for DirectShow
     // ========================================================================
@@ -1204,8 +1212,10 @@ namespace WebcamSettingsManager
             devMenu.DropDownItems.Add("Refresh Devices", null, (s, e) => RefreshDevices());
 
             var helpMenu = new ToolStripMenuItem("Help");
+            helpMenu.DropDownItems.Add("Check for Updates", null, (s, e) => CheckForUpdates());
+            helpMenu.DropDownItems.Add(new ToolStripSeparator());
             helpMenu.DropDownItems.Add("About", null, (s, e) =>
-                MessageBox.Show("Webcam Settings Manager\n\nSave and restore DirectShow webcam settings.\nSupports PTZ preset positions.\n\nBuilt with .NET Framework WinForms.",
+                MessageBox.Show("Webcam Settings Manager v" + AppInfo.Version + "\n\nSave and restore DirectShow webcam settings.\nSupports PTZ preset positions.\n\nBuilt with .NET Framework WinForms.",
                     "About", MessageBoxButtons.OK, MessageBoxIcon.Information));
 
             _menuStrip.Items.Add(fileMenu);
@@ -1461,6 +1471,192 @@ namespace WebcamSettingsManager
                     SetStatus("Generated: " + dlg.FileName);
                 }
             }
+        }
+
+        private void CheckForUpdates()
+        {
+            SetStatus("Checking for updates...");
+            Cursor = Cursors.WaitCursor;
+            Application.DoEvents();
+
+            try
+            {
+                string apiUrl = "https://api.github.com/repos/" + AppInfo.GitHubOwner + "/" + AppInfo.GitHubRepo + "/releases/latest";
+
+                ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+                var request = (HttpWebRequest)WebRequest.Create(apiUrl);
+                request.UserAgent = "WebcamSettingsManager/" + AppInfo.Version;
+                request.Accept = "application/json";
+                request.Timeout = 10000;
+
+                string json;
+                using (var response = (HttpWebResponse)request.GetResponse())
+                using (var reader = new StreamReader(response.GetResponseStream()))
+                {
+                    json = reader.ReadToEnd();
+                }
+
+                // Parse tag_name, body, and browser_download_url for .exe
+                string tagName = ExtractJsonString(json, "tag_name");
+                string body = ExtractJsonString(json, "body");
+                string htmlUrl = ExtractJsonString(json, "html_url");
+
+                // Find .exe download URL from assets
+                string exeUrl = null;
+                string exeName = null;
+                int assetsIdx = json.IndexOf("\"assets\"");
+                if (assetsIdx > 0)
+                {
+                    string assetsSection = json.Substring(assetsIdx);
+                    // Find all browser_download_url entries
+                    int searchFrom = 0;
+                    while (true)
+                    {
+                        int dlIdx = assetsSection.IndexOf("\"browser_download_url\"", searchFrom);
+                        if (dlIdx < 0) break;
+                        string url = ExtractJsonString(assetsSection.Substring(dlIdx - 1), "browser_download_url");
+                        if (url != null && url.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                        {
+                            exeUrl = url;
+                            exeName = url.Substring(url.LastIndexOf('/') + 1);
+                            break;
+                        }
+                        searchFrom = dlIdx + 20;
+                    }
+                }
+
+                Cursor = Cursors.Default;
+
+                // Clean version strings for comparison
+                string remoteVer = (tagName ?? "").TrimStart('v', 'V');
+                string localVer = AppInfo.Version;
+
+                if (remoteVer == localVer)
+                {
+                    SetStatus("You are on the latest version (v" + localVer + ").");
+                    MessageBox.Show("You are already on the latest version.\n\nInstalled: v" + localVer,
+                        "No Update Available", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                // Show release notes and ask user
+                string message = "A new version is available!\n\n"
+                    + "Installed: v" + localVer + "\n"
+                    + "Latest: " + (tagName ?? "unknown") + "\n\n"
+                    + "--- Release Notes ---\n"
+                    + (body ?? "(no release notes)") + "\n\n";
+
+                if (exeUrl != null)
+                    message += "Do you want to download and install the update?";
+                else
+                    message += "No .exe found in this release. Visit the releases page?";
+
+                var result = MessageBox.Show(message, "Update Available",
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Question);
+
+                if (result != DialogResult.Yes) return;
+
+                if (exeUrl != null)
+                {
+                    // Download the new exe
+                    SetStatus("Downloading update...");
+                    Cursor = Cursors.WaitCursor;
+                    Application.DoEvents();
+
+                    string currentExe = Application.ExecutablePath;
+                    string newExe = currentExe + ".update";
+                    string oldExe = currentExe + ".old";
+
+                    using (var wc = new WebClient())
+                    {
+                        wc.Headers.Add("User-Agent", "WebcamSettingsManager/" + AppInfo.Version);
+                        wc.DownloadFile(exeUrl, newExe);
+                    }
+
+                    Cursor = Cursors.Default;
+
+                    // Create a batch script that waits for this process to exit,
+                    // swaps the files, and launches the new version
+                    string batPath = Path.Combine(Path.GetTempPath(), "wmm_update.bat");
+                    string bat = "@echo off\r\n"
+                        + "echo Updating Webcam Settings Manager...\r\n"
+                        + "timeout /t 2 /nobreak >nul\r\n"
+                        + "if exist \"" + oldExe + "\" del \"" + oldExe + "\"\r\n"
+                        + "move \"" + currentExe + "\" \"" + oldExe + "\"\r\n"
+                        + "move \"" + newExe + "\" \"" + currentExe + "\"\r\n"
+                        + "start \"\" \"" + currentExe + "\"\r\n"
+                        + "del \"" + oldExe + "\"\r\n"
+                        + "del \"%~f0\"\r\n";
+                    File.WriteAllText(batPath, bat);
+
+                    // Launch the updater and exit
+                    var psi = new System.Diagnostics.ProcessStartInfo();
+                    psi.FileName = batPath;
+                    psi.CreateNoWindow = true;
+                    psi.UseShellExecute = false;
+                    System.Diagnostics.Process.Start(psi);
+                    Application.Exit();
+                }
+                else
+                {
+                    // Open releases page in browser
+                    System.Diagnostics.Process.Start(htmlUrl ?? ("https://github.com/" + AppInfo.GitHubOwner + "/" + AppInfo.GitHubRepo + "/releases"));
+                }
+            }
+            catch (WebException wex)
+            {
+                Cursor = Cursors.Default;
+                var httpResp = wex.Response as HttpWebResponse;
+                if (httpResp != null && httpResp.StatusCode == HttpStatusCode.NotFound)
+                {
+                    SetStatus("No releases found.");
+                    MessageBox.Show("No releases found on GitHub yet.", "Check for Updates", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                else
+                {
+                    SetStatus("Update check failed.");
+                    MessageBox.Show("Could not check for updates:\n" + wex.Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+            }
+            catch (Exception ex)
+            {
+                Cursor = Cursors.Default;
+                SetStatus("Update check failed.");
+                MessageBox.Show("Could not check for updates:\n" + ex.Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        // Simple helper to extract a string value from JSON by key
+        private string ExtractJsonString(string json, string key)
+        {
+            string search = "\"" + key + "\"";
+            int idx = json.IndexOf(search);
+            if (idx < 0) return null;
+            int colonIdx = json.IndexOf(':', idx + search.Length);
+            if (colonIdx < 0) return null;
+            // Skip whitespace after colon
+            int start = colonIdx + 1;
+            while (start < json.Length && (json[start] == ' ' || json[start] == '\t' || json[start] == '\r' || json[start] == '\n'))
+                start++;
+            if (start >= json.Length || json[start] != '"') return null;
+            start++; // skip opening quote
+            var sb = new StringBuilder();
+            while (start < json.Length)
+            {
+                if (json[start] == '\\' && start + 1 < json.Length)
+                {
+                    char next = json[start + 1];
+                    if (next == '"') { sb.Append('"'); start += 2; }
+                    else if (next == '\\') { sb.Append('\\'); start += 2; }
+                    else if (next == 'n') { sb.Append('\n'); start += 2; }
+                    else if (next == 'r') { sb.Append('\r'); start += 2; }
+                    else if (next == 't') { sb.Append('\t'); start += 2; }
+                    else { sb.Append(next); start += 2; }
+                }
+                else if (json[start] == '"') break;
+                else { sb.Append(json[start]); start++; }
+            }
+            return sb.ToString();
         }
 
         private void ImportProfile()
