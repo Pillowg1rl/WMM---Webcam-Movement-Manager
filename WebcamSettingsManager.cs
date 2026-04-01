@@ -19,7 +19,7 @@ namespace WebcamSettingsManager
 {
     static class AppInfo
     {
-        public const string Version = "1.0.0";
+        public const string Version = "2.0.0";
         public const string GitHubOwner = "Pillowg1rl";
         public const string GitHubRepo = "WMM---Webcam-Movement-Manager";
     }
@@ -210,15 +210,285 @@ namespace WebcamSettingsManager
     {
         public string Name { get; set; }
         public string Created { get; set; }
+        public string Notes { get; set; }
         public Dictionary<string, ProfileDevice> Devices { get; set; }
 
         public Profile()
         {
+            Notes = "";
             Devices = new Dictionary<string, ProfileDevice>();
         }
     }
 
     #endregion
+
+    // ========================================================================
+    // AppSettings - persisted user preferences (dark mode, etc.)
+    // ========================================================================
+
+    #region AppSettings
+
+    class HotkeyBinding
+    {
+        public int Modifiers { get; set; } // Win32 modifier flags
+        public int Key { get; set; }       // Win32 virtual key code
+
+        public string DisplayName
+        {
+            get
+            {
+                var parts = new List<string>();
+                if ((Modifiers & 0x0002) != 0) parts.Add("Ctrl");
+                if ((Modifiers & 0x0001) != 0) parts.Add("Alt");
+                if ((Modifiers & 0x0004) != 0) parts.Add("Shift");
+                if ((Modifiers & 0x0008) != 0) parts.Add("Win");
+                parts.Add(((Keys)Key).ToString());
+                return string.Join("+", parts);
+            }
+        }
+    }
+
+    class AppSettings
+    {
+        public bool DarkMode { get; set; }
+        public Dictionary<string, HotkeyBinding> Hotkeys { get; set; }
+
+        private static string SettingsPath
+        {
+            get
+            {
+                return Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                    "WebcamSettings", "settings.json");
+            }
+        }
+
+        public AppSettings()
+        {
+            DarkMode = false;
+            Hotkeys = new Dictionary<string, HotkeyBinding>();
+        }
+
+        public static AppSettings Load()
+        {
+            try
+            {
+                if (File.Exists(SettingsPath))
+                {
+                    string json = File.ReadAllText(SettingsPath);
+                    var s = new AppSettings();
+                    if (json.Contains("\"DarkMode\": true") || json.Contains("\"DarkMode\":true"))
+                        s.DarkMode = true;
+
+                    // Parse hotkeys
+                    int hkIdx = json.IndexOf("\"Hotkeys\"");
+                    if (hkIdx >= 0)
+                    {
+                        int braceStart = json.IndexOf('{', hkIdx + 9);
+                        if (braceStart >= 0)
+                        {
+                            int depth = 1;
+                            int braceEnd = braceStart + 1;
+                            while (braceEnd < json.Length && depth > 0)
+                            {
+                                if (json[braceEnd] == '{') depth++;
+                                else if (json[braceEnd] == '}') depth--;
+                                braceEnd++;
+                            }
+                            string hkJson = json.Substring(braceStart, braceEnd - braceStart);
+                            ParseHotkeys(s, hkJson);
+                        }
+                    }
+                    return s;
+                }
+            }
+            catch { }
+            return new AppSettings();
+        }
+
+        private static void ParseHotkeys(AppSettings s, string json)
+        {
+            // Simple parser for: { "name": {"Modifiers": N, "Key": N}, ... }
+            int pos = 1; // skip opening {
+            while (pos < json.Length)
+            {
+                int nameStart = json.IndexOf('"', pos);
+                if (nameStart < 0) break;
+                int nameEnd = json.IndexOf('"', nameStart + 1);
+                if (nameEnd < 0) break;
+                string name = json.Substring(nameStart + 1, nameEnd - nameStart - 1);
+
+                int objStart = json.IndexOf('{', nameEnd);
+                if (objStart < 0) break;
+                int objEnd = json.IndexOf('}', objStart);
+                if (objEnd < 0) break;
+                string objStr = json.Substring(objStart, objEnd - objStart + 1);
+
+                var hk = new HotkeyBinding();
+                int modIdx = objStr.IndexOf("\"Modifiers\"");
+                int keyIdx = objStr.IndexOf("\"Key\"");
+                if (modIdx >= 0)
+                {
+                    int colonIdx = objStr.IndexOf(':', modIdx);
+                    if (colonIdx >= 0)
+                    {
+                        string numStr = "";
+                        for (int i = colonIdx + 1; i < objStr.Length; i++)
+                        {
+                            char c = objStr[i];
+                            if (char.IsDigit(c) || c == '-') numStr += c;
+                            else if (numStr.Length > 0) break;
+                        }
+                        int val; if (int.TryParse(numStr, out val)) hk.Modifiers = val;
+                    }
+                }
+                if (keyIdx >= 0)
+                {
+                    int colonIdx = objStr.IndexOf(':', keyIdx);
+                    if (colonIdx >= 0)
+                    {
+                        string numStr = "";
+                        for (int i = colonIdx + 1; i < objStr.Length; i++)
+                        {
+                            char c = objStr[i];
+                            if (char.IsDigit(c) || c == '-') numStr += c;
+                            else if (numStr.Length > 0) break;
+                        }
+                        int val; if (int.TryParse(numStr, out val)) hk.Key = val;
+                    }
+                }
+
+                if (hk.Key != 0)
+                    s.Hotkeys[name] = hk;
+
+                pos = objEnd + 1;
+            }
+        }
+
+        public void Save()
+        {
+            try
+            {
+                string dir = Path.GetDirectoryName(SettingsPath);
+                Directory.CreateDirectory(dir);
+                var sb = new StringBuilder();
+                sb.AppendLine("{");
+                sb.AppendLine("  \"DarkMode\": " + (DarkMode ? "true" : "false") + ",");
+                sb.AppendLine("  \"Hotkeys\": {");
+                int idx = 0;
+                foreach (var kvp in Hotkeys)
+                {
+                    string comma = idx < Hotkeys.Count - 1 ? "," : "";
+                    sb.AppendLine("    \"" + kvp.Key.Replace("\"", "\\\"") + "\": {\"Modifiers\": " + kvp.Value.Modifiers + ", \"Key\": " + kvp.Value.Key + "}" + comma);
+                    idx++;
+                }
+                sb.AppendLine("  }");
+                sb.AppendLine("}");
+                File.WriteAllText(SettingsPath, sb.ToString());
+            }
+            catch { }
+        }
+    }
+
+    #endregion
+
+    // ========================================================================
+    // DarkModeHelper - apply dark/light theme to all controls
+    // ========================================================================
+
+    #region DarkModeHelper
+
+    static class DarkModeHelper
+    {
+        // Dark theme colors
+        static readonly Color DarkBg = Color.FromArgb(30, 30, 30);
+        static readonly Color DarkControl = Color.FromArgb(45, 45, 45);
+        static readonly Color DarkText = Color.FromArgb(220, 220, 220);
+        static readonly Color DarkBorder = Color.FromArgb(60, 60, 60);
+        static readonly Color DarkGroupPTZ = Color.FromArgb(55, 45, 30);
+        static readonly Color DarkGroupCam = Color.FromArgb(35, 50, 35);
+        static readonly Color DarkGroupVideo = Color.FromArgb(35, 35, 55);
+
+        // Light theme colors
+        static readonly Color LightGroupPTZ = Color.FromArgb(255, 245, 230);
+        static readonly Color LightGroupCam = Color.FromArgb(240, 250, 240);
+        static readonly Color LightGroupVideo = Color.FromArgb(240, 240, 250);
+
+        public static Color GetGroupColor(string groupTitle, bool dark)
+        {
+            if (groupTitle == "PTZ Controls") return dark ? DarkGroupPTZ : LightGroupPTZ;
+            if (groupTitle == "Camera Control") return dark ? DarkGroupCam : LightGroupCam;
+            return dark ? DarkGroupVideo : LightGroupVideo;
+        }
+
+        public static void ApplyTheme(Control root, bool dark)
+        {
+            ApplyToControl(root, dark);
+            foreach (Control c in root.Controls)
+                ApplyTheme(c, dark);
+        }
+
+        private static void ApplyToControl(Control c, bool dark)
+        {
+            if (c is Form)
+            {
+                c.BackColor = dark ? DarkBg : SystemColors.Control;
+                c.ForeColor = dark ? DarkText : SystemColors.ControlText;
+            }
+            else if (c is MenuStrip || c is ToolStrip || c is StatusStrip)
+            {
+                c.BackColor = dark ? DarkControl : SystemColors.Control;
+                c.ForeColor = dark ? DarkText : SystemColors.ControlText;
+            }
+            else if (c is GroupBox)
+            {
+                var gb = (GroupBox)c;
+                gb.ForeColor = dark ? DarkText : SystemColors.ControlText;
+                gb.BackColor = GetGroupColor(gb.Text, dark);
+            }
+            else if (c is TabControl)
+            {
+                c.BackColor = dark ? DarkBg : SystemColors.Control;
+                c.ForeColor = dark ? DarkText : SystemColors.ControlText;
+            }
+            else if (c is TabPage)
+            {
+                c.BackColor = dark ? DarkBg : SystemColors.Control;
+                c.ForeColor = dark ? DarkText : SystemColors.ControlText;
+            }
+            else if (c is TextBox || c is NumericUpDown || c is ComboBox || c is RichTextBox)
+            {
+                c.BackColor = dark ? Color.FromArgb(55, 55, 55) : SystemColors.Window;
+                c.ForeColor = dark ? DarkText : SystemColors.WindowText;
+            }
+            else if (c is Button)
+            {
+                c.BackColor = dark ? DarkControl : SystemColors.Control;
+                c.ForeColor = dark ? DarkText : SystemColors.ControlText;
+            }
+            else if (c is CheckBox || c is Label)
+            {
+                c.ForeColor = dark ? DarkText : SystemColors.ControlText;
+            }
+            else if (c is Panel)
+            {
+                if (!(c.BackColor != Color.Transparent && c.Parent is GroupBox))
+                    c.BackColor = dark ? DarkBg : SystemColors.Control;
+                c.ForeColor = dark ? DarkText : SystemColors.ControlText;
+            }
+            else if (c is TrackBar)
+            {
+                c.BackColor = dark ? DarkControl : SystemColors.Control;
+            }
+            else if (c is PictureBox)
+            {
+                c.BackColor = dark ? Color.FromArgb(20, 20, 20) : Color.FromArgb(200, 200, 200);
+            }
+        }
+    }
+
+    #endregion
+
 
     // ========================================================================
     // CameraDevice - wraps a single DirectShow video input device
@@ -317,40 +587,37 @@ namespace WebcamSettingsManager
             return _camCtrl.Set(prop, value, flags) == 0;
         }
 
-        // PTZ cameras have motors that take time to move. This method retries
-        // until the value is verified or max attempts reached.
+        // PTZ cameras have slow motors. Send the absolute target value repeatedly
+        // until the motor settles at the correct position.
         public bool SetCameraControlPropertyVerified(CameraControlProperty prop, int targetValue, int flags,
             int maxAttempts, int delayMs, out int finalValue)
         {
             finalValue = targetValue;
             if (!_hasCamCtrl) return false;
 
-            // Get the step size to determine acceptable tolerance
             var range = GetCameraControlRange(prop);
             int tolerance = (range != null && range.Step > 0) ? range.Step : 1;
 
             for (int attempt = 0; attempt < maxAttempts; attempt++)
             {
-                // Set the target value
-                int hr = _camCtrl.Set(prop, targetValue, flags);
-                if (hr != 0) return false;
+                // Always send the absolute target value
+                _camCtrl.Set(prop, targetValue, flags);
 
                 // Wait for motor to move
                 Thread.Sleep(delayMs);
 
-                // Read back the actual value
+                // Read back actual position
                 int currentVal, currentFlags;
-                hr = _camCtrl.Get(prop, out currentVal, out currentFlags);
+                int hr = _camCtrl.Get(prop, out currentVal, out currentFlags);
                 if (hr != 0) return false;
 
                 finalValue = currentVal;
 
-                // Check if close enough (within step tolerance)
+                // Close enough?
                 if (Math.Abs(currentVal - targetValue) <= tolerance)
                     return true;
             }
 
-            // Didn't reach target after all attempts
             return false;
         }
 
@@ -416,7 +683,7 @@ namespace WebcamSettingsManager
                 {
                     int finalVal;
                     bool ok = SetCameraControlPropertyVerified(prop, kvp.Value.Value, kvp.Value.Flags,
-                        10, 100, out finalVal);
+                        20, 300, out finalVal);
                     if (!ok)
                         errors.Add("CameraControl." + kvp.Key + ": target=" + kvp.Value.Value + " actual=" + finalVal);
                 }
@@ -552,12 +819,13 @@ namespace WebcamSettingsManager
             return profiles;
         }
 
-        public void SaveProfile(string name, List<CameraDevice> devices, string devicePathFilter = null)
+        public void SaveProfile(string name, List<CameraDevice> devices, string devicePathFilter = null, string notes = null)
         {
             var profile = new Profile
             {
                 Name = name,
-                Created = DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss")
+                Created = DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss"),
+                Notes = notes ?? ""
             };
 
             foreach (var cam in devices)
@@ -650,6 +918,7 @@ namespace WebcamSettingsManager
             sb.AppendLine("{");
             sb.AppendLine("  \"Name\": " + JsonStr(profile.Name) + ",");
             sb.AppendLine("  \"Created\": " + JsonStr(profile.Created) + ",");
+            sb.AppendLine("  \"Notes\": " + JsonStr(profile.Notes) + ",");
             sb.AppendLine("  \"Devices\": {");
 
             int devIdx = 0;
@@ -701,6 +970,7 @@ namespace WebcamSettingsManager
 
             if (obj.ContainsKey("Name")) profile.Name = obj["Name"] as string;
             if (obj.ContainsKey("Created")) profile.Created = obj["Created"] as string;
+            if (obj.ContainsKey("Notes")) profile.Notes = (obj["Notes"] as string) ?? "";
 
             if (obj.ContainsKey("Devices"))
             {
@@ -1180,6 +1450,29 @@ namespace WebcamSettingsManager
         private List<CameraDevice> _cameras = new List<CameraDevice>();
         private List<CameraTabPage> _cameraTabs = new List<CameraTabPage>();
 
+        // Dark mode
+        private AppSettings _settings;
+        private ToolStripMenuItem _darkModeItem;
+
+        // Undo
+        private Dictionary<string, ProfileDevice> _undoState;
+        private ToolStripButton _undoBtn;
+
+        // Profile notes
+        private Label _notesLabel;
+        private Panel _profileInfoPanel;
+
+        // Global hotkeys
+        private List<string> _hotkeyProfiles = new List<string>();
+        const int WM_HOTKEY = 0x0312;
+        const int HOTKEY_BASE_ID = 9000;
+
+        [DllImport("user32.dll")]
+        static extern bool RegisterHotKey(IntPtr hWnd, int id, int fsModifiers, int vk);
+        [DllImport("user32.dll")]
+        static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
+
         public MainForm()
         {
             Text = "Webcam Settings Manager";
@@ -1187,13 +1480,21 @@ namespace WebcamSettingsManager
             MinimumSize = new Size(700, 500);
             StartPosition = FormStartPosition.CenterScreen;
 
+            _settings = AppSettings.Load();
             _profileMgr = new ProfileManager();
 
             BuildMenu();
             BuildToolbar();
+            BuildProfileInfoPanel();
             BuildTabControl();
             BuildStatusBar();
             EnumerateAndPopulate();
+
+            if (_settings.DarkMode)
+            {
+                _darkModeItem.Checked = true;
+                DarkModeHelper.ApplyTheme(this, true);
+            }
         }
 
         private void BuildMenu()
@@ -1208,17 +1509,26 @@ namespace WebcamSettingsManager
             fileMenu.DropDownItems.Add(new ToolStripSeparator());
             fileMenu.DropDownItems.Add("Exit", null, (s, e) => Close());
 
+            var viewMenu = new ToolStripMenuItem("View");
+            _darkModeItem = new ToolStripMenuItem("Dark Mode");
+            _darkModeItem.CheckOnClick = true;
+            _darkModeItem.Click += (s, e) => ToggleDarkMode();
+            viewMenu.DropDownItems.Add(_darkModeItem);
+
             var devMenu = new ToolStripMenuItem("Devices");
             devMenu.DropDownItems.Add("Refresh Devices", null, (s, e) => RefreshDevices());
 
             var helpMenu = new ToolStripMenuItem("Help");
             helpMenu.DropDownItems.Add("Check for Updates", null, (s, e) => CheckForUpdates());
             helpMenu.DropDownItems.Add(new ToolStripSeparator());
+            helpMenu.DropDownItems.Add("Hotkeys", null, (s, e) => ShowHotkeyHelp());
+            helpMenu.DropDownItems.Add(new ToolStripSeparator());
             helpMenu.DropDownItems.Add("About", null, (s, e) =>
                 MessageBox.Show("Webcam Settings Manager v" + AppInfo.Version + "\n\nSave and restore DirectShow webcam settings.\nSupports PTZ preset positions.\n\nBuilt with .NET Framework WinForms.",
                     "About", MessageBoxButtons.OK, MessageBoxIcon.Information));
 
             _menuStrip.Items.Add(fileMenu);
+            _menuStrip.Items.Add(viewMenu);
             _menuStrip.Items.Add(devMenu);
             _menuStrip.Items.Add(helpMenu);
             MainMenuStrip = _menuStrip;
@@ -1252,8 +1562,48 @@ namespace WebcamSettingsManager
 
             _toolbar.Items.Add(new ToolStripButton("Delete", null, (s, e) => DeleteProfile()) { ToolTipText = "Delete selected profile" });
             _toolbar.Items.Add(new ToolStripButton("Generate .bat", null, (s, e) => GenerateBat()) { ToolTipText = "Generate a .bat file to restore this profile" });
+            _toolbar.Items.Add(new ToolStripButton("Set Hotkey", null, (s, e) => SetHotkeyForProfile()) { ToolTipText = "Assign a global hotkey to restore this profile" });
+            _toolbar.Items.Add(new ToolStripSeparator());
+            _undoBtn = new ToolStripButton("Undo", null, (s, e) => PerformUndo());
+            _undoBtn.ToolTipText = "Undo last restore";
+            _undoBtn.Enabled = false;
+            _toolbar.Items.Add(_undoBtn);
 
             Controls.Add(_toolbar);
+        }
+
+        private void BuildProfileInfoPanel()
+        {
+            _profileInfoPanel = new Panel
+            {
+                Dock = DockStyle.Right,
+                Width = 180,
+                Padding = new Padding(5)
+            };
+
+            _notesLabel = new Label
+            {
+                Dock = DockStyle.Fill,
+                TextAlign = ContentAlignment.TopLeft,
+                Text = "",
+                Padding = new Padding(2)
+            };
+
+            _profileInfoPanel.Controls.Add(_notesLabel);
+
+            var titleLabel = new Label
+            {
+                Text = "Profile Notes",
+                Dock = DockStyle.Top,
+                Height = 20,
+                TextAlign = ContentAlignment.MiddleCenter,
+                Font = new Font(Font.FontFamily, 9, FontStyle.Bold)
+            };
+            _profileInfoPanel.Controls.Add(titleLabel);
+
+            Controls.Add(_profileInfoPanel);
+
+            _profileCombo.SelectedIndexChanged += (s, e) => UpdateProfileInfo();
         }
 
         private void BuildTabControl()
@@ -1354,8 +1704,32 @@ namespace WebcamSettingsManager
                 return;
             }
 
-            string name = PromptProfileName();
-            if (string.IsNullOrEmpty(name)) return;
+            string name = null;
+            string notes = "";
+
+            // If a profile is selected, offer to overwrite it
+            if (_profileCombo.SelectedItem != null)
+            {
+                string existing = _profileCombo.SelectedItem.ToString();
+                var result = MessageBox.Show(
+                    "Overwrite existing profile '" + existing + "'?\n\nYes = overwrite, No = save as new",
+                    "Save Profile", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+                if (result == DialogResult.Cancel) return;
+                if (result == DialogResult.Yes)
+                {
+                    name = existing;
+                    // Keep existing notes
+                    var existingProfile = _profileMgr.LoadProfile(name);
+                    if (existingProfile != null) notes = existingProfile.Notes ?? "";
+                }
+            }
+
+            // If not overwriting, prompt for new name
+            if (name == null)
+            {
+                name = PromptProfileName(out notes);
+                if (string.IsNullOrEmpty(name)) return;
+            }
 
             try
             {
@@ -1367,10 +1741,10 @@ namespace WebcamSettingsManager
                         filter = selectedTab.Camera.DevicePath;
                 }
 
-                _profileMgr.SaveProfile(name, _cameras, filter);
+                _profileMgr.SaveProfile(name, _cameras, filter, notes);
                 RefreshProfileList();
+                RegisterProfileHotkeys();
 
-                // Select the newly saved profile
                 int idx = _profileCombo.Items.IndexOf(name);
                 if (idx >= 0) _profileCombo.SelectedIndex = idx;
 
@@ -1407,6 +1781,10 @@ namespace WebcamSettingsManager
                     if (selectedTab != null)
                         filter = selectedTab.Camera.DevicePath;
                 }
+
+                // Snapshot current state for undo
+                _undoState = SnapshotCurrentState(_cameras, filter);
+                _undoBtn.Enabled = true;
 
                 SetStatus("Restoring profile '" + name + "'... (PTZ motors may take a moment)");
                 Cursor = Cursors.WaitCursor;
@@ -1445,6 +1823,7 @@ namespace WebcamSettingsManager
             {
                 _profileMgr.DeleteProfile(name);
                 RefreshProfileList();
+                RegisterProfileHotkeys();
                 SetStatus("Deleted profile: " + name);
             }
         }
@@ -1716,30 +2095,37 @@ namespace WebcamSettingsManager
             catch { }
         }
 
-        private string PromptProfileName()
+        private string PromptProfileName(out string notes)
         {
+            notes = "";
             using (var dlg = new Form())
             {
                 dlg.Text = "Save Profile";
-                dlg.Size = new Size(350, 150);
+                dlg.Size = new Size(380, 250);
                 dlg.StartPosition = FormStartPosition.CenterParent;
                 dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
                 dlg.MaximizeBox = false;
                 dlg.MinimizeBox = false;
 
-                var lbl = new Label { Text = "Profile name:", Location = new Point(15, 20), AutoSize = true };
-                var txt = new TextBox { Location = new Point(15, 45), Width = 300, Text = "MyProfile" };
-                var btnOk = new Button { Text = "Save", DialogResult = DialogResult.OK, Location = new Point(155, 80), Width = 75 };
-                var btnCancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Location = new Point(240, 80), Width = 75 };
+                var lbl = new Label { Text = "Profile name:", Location = new Point(15, 15), AutoSize = true };
+                var txt = new TextBox { Location = new Point(15, 35), Width = 330, Text = "MyProfile" };
+                var lblNotes = new Label { Text = "Notes (optional):", Location = new Point(15, 65), AutoSize = true };
+                var txtNotes = new TextBox { Location = new Point(15, 85), Width = 330, Height = 70, Multiline = true, ScrollBars = ScrollBars.Vertical };
+                var btnOk = new Button { Text = "Save", DialogResult = DialogResult.OK, Location = new Point(185, 170), Width = 75 };
+                var btnCancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Location = new Point(270, 170), Width = 75 };
+
+                if (_settings.DarkMode)
+                    DarkModeHelper.ApplyTheme(dlg, true);
 
                 dlg.AcceptButton = btnOk;
                 dlg.CancelButton = btnCancel;
-                dlg.Controls.AddRange(new Control[] { lbl, txt, btnOk, btnCancel });
+                dlg.Controls.AddRange(new Control[] { lbl, txt, lblNotes, txtNotes, btnOk, btnCancel });
 
                 txt.SelectAll();
 
                 if (dlg.ShowDialog(this) == DialogResult.OK && !string.IsNullOrWhiteSpace(txt.Text))
                 {
+                    notes = txtNotes.Text;
                     // Sanitize filename
                     string name = txt.Text.Trim();
                     foreach (char c in Path.GetInvalidFileNameChars())
@@ -1750,8 +2136,268 @@ namespace WebcamSettingsManager
             }
         }
 
+        // ---- Dark Mode ----
+
+        private void ToggleDarkMode()
+        {
+            _settings.DarkMode = _darkModeItem.Checked;
+            _settings.Save();
+            DarkModeHelper.ApplyTheme(this, _settings.DarkMode);
+        }
+
+        // ---- Profile Info Panel ----
+
+        private void UpdateProfileInfo()
+        {
+            if (_profileCombo.SelectedItem == null)
+            {
+                _notesLabel.Text = "";
+                return;
+            }
+
+            string name = _profileCombo.SelectedItem.ToString();
+            var profile = _profileMgr.LoadProfile(name);
+            if (profile != null && !string.IsNullOrEmpty(profile.Notes))
+                _notesLabel.Text = profile.Notes;
+            else
+                _notesLabel.Text = "(no notes)";
+        }
+
+        // ---- Undo ----
+
+        private Dictionary<string, ProfileDevice> SnapshotCurrentState(List<CameraDevice> cameras, string devicePathFilter)
+        {
+            var snapshot = new Dictionary<string, ProfileDevice>();
+            foreach (var cam in cameras)
+            {
+                if (devicePathFilter != null && cam.DevicePath != devicePathFilter) continue;
+                var dev = new ProfileDevice { FriendlyName = cam.FriendlyName };
+                foreach (var prop in cam.GetAllProperties())
+                {
+                    var pp = new ProfileProperty { Value = prop.Current.Value, Flags = prop.Current.Flags };
+                    if (prop.Category == "VideoProcAmp")
+                        dev.VideoProcAmp[prop.Name] = pp;
+                    else
+                        dev.CameraControl[prop.Name] = pp;
+                }
+                snapshot[cam.DevicePath] = dev;
+            }
+            return snapshot;
+        }
+
+        private void PerformUndo()
+        {
+            if (_undoState == null || _undoState.Count == 0)
+            {
+                MessageBox.Show("Nothing to undo.", "Undo", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            SetStatus("Undoing last restore...");
+            Cursor = Cursors.WaitCursor;
+            Application.DoEvents();
+
+            var errors = new List<string>();
+            foreach (var cam in _cameras)
+            {
+                ProfileDevice dev;
+                if (_undoState.TryGetValue(cam.DevicePath, out dev))
+                    errors.AddRange(cam.ApplyProperties(dev));
+            }
+
+            Cursor = Cursors.Default;
+            foreach (var tab in _cameraTabs) tab.RefreshFromDevice();
+
+            _undoState = null;
+            _undoBtn.Enabled = false;
+
+            if (errors.Count == 0)
+                SetStatus("Undo complete.");
+            else
+                SetStatus("Undo done with " + errors.Count + " warning(s).");
+        }
+
+        // ---- Global Hotkeys ----
+
+        private void RegisterProfileHotkeys()
+        {
+            UnregisterAllHotkeys();
+            _hotkeyProfiles.Clear();
+
+            int id = 0;
+            foreach (var kvp in _settings.Hotkeys)
+            {
+                _hotkeyProfiles.Add(kvp.Key);
+                RegisterHotKey(Handle, HOTKEY_BASE_ID + id, kvp.Value.Modifiers, kvp.Value.Key);
+                id++;
+            }
+        }
+
+        private void UnregisterAllHotkeys()
+        {
+            for (int i = 0; i < _hotkeyProfiles.Count + 10; i++)
+                UnregisterHotKey(Handle, HOTKEY_BASE_ID + i);
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == WM_HOTKEY)
+            {
+                int id = m.WParam.ToInt32() - HOTKEY_BASE_ID;
+                if (id >= 0 && id < _hotkeyProfiles.Count)
+                {
+                    string profileName = _hotkeyProfiles[id];
+                    _undoState = SnapshotCurrentState(_cameras, null);
+                    _undoBtn.Enabled = true;
+
+                    var errors = _profileMgr.ApplyProfile(profileName, _cameras);
+                    foreach (var tab in _cameraTabs) tab.RefreshFromDevice();
+
+                    HotkeyBinding hk;
+                    string hkName = _settings.Hotkeys.TryGetValue(profileName, out hk) ? hk.DisplayName : "?";
+                    if (errors.Count == 0)
+                        SetStatus("Hotkey " + hkName + ": restored '" + profileName + "'");
+                    else
+                        SetStatus("Hotkey " + hkName + ": restored '" + profileName + "' with " + errors.Count + " warning(s)");
+                }
+            }
+            base.WndProc(ref m);
+        }
+
+        private void SetHotkeyForProfile()
+        {
+            if (_profileCombo.SelectedItem == null)
+            {
+                MessageBox.Show("Select a profile first.", "Set Hotkey", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            string profileName = _profileCombo.SelectedItem.ToString();
+
+            using (var dlg = new Form())
+            {
+                dlg.Text = "Set Hotkey for '" + profileName + "'";
+                dlg.Size = new Size(350, 180);
+                dlg.StartPosition = FormStartPosition.CenterParent;
+                dlg.FormBorderStyle = FormBorderStyle.FixedDialog;
+                dlg.MaximizeBox = false;
+                dlg.MinimizeBox = false;
+                dlg.KeyPreview = true;
+
+                var lbl = new Label
+                {
+                    Text = "Press any key combination (e.g. Ctrl+F1, Alt+Shift+1)...\n\nPress Escape to cancel, Delete to remove hotkey.",
+                    Location = new Point(15, 15),
+                    Size = new Size(300, 60)
+                };
+
+                var resultLabel = new Label
+                {
+                    Text = "",
+                    Location = new Point(15, 80),
+                    Size = new Size(300, 25),
+                    Font = new Font(Font.FontFamily, 11, FontStyle.Bold)
+                };
+
+                // Show current hotkey if set
+                HotkeyBinding existing;
+                if (_settings.Hotkeys.TryGetValue(profileName, out existing))
+                    resultLabel.Text = "Current: " + existing.DisplayName;
+
+                var btnOk = new Button { Text = "OK", DialogResult = DialogResult.OK, Location = new Point(170, 110), Width = 75, Enabled = false };
+                var btnCancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Location = new Point(255, 110), Width = 75 };
+                var btnRemove = new Button { Text = "Remove", Location = new Point(15, 110), Width = 75 };
+
+                HotkeyBinding captured = null;
+
+                btnRemove.Click += (s, e) =>
+                {
+                    _settings.Hotkeys.Remove(profileName);
+                    _settings.Save();
+                    RegisterProfileHotkeys();
+                    SetStatus("Hotkey removed for '" + profileName + "'.");
+                    dlg.DialogResult = DialogResult.Cancel;
+                    dlg.Close();
+                };
+
+                if (_settings.DarkMode)
+                    DarkModeHelper.ApplyTheme(dlg, true);
+
+                dlg.AcceptButton = btnOk;
+                dlg.CancelButton = btnCancel;
+                dlg.Controls.AddRange(new Control[] { lbl, resultLabel, btnOk, btnCancel, btnRemove });
+
+                dlg.KeyDown += (s, e) =>
+                {
+                    if (e.KeyCode == Keys.Escape) return;
+                    if (e.KeyCode == Keys.Delete)
+                    {
+                        _settings.Hotkeys.Remove(profileName);
+                        _settings.Save();
+                        RegisterProfileHotkeys();
+                        SetStatus("Hotkey removed for '" + profileName + "'.");
+                        dlg.DialogResult = DialogResult.Cancel;
+                        dlg.Close();
+                        return;
+                    }
+
+                    // Ignore lone modifier keys
+                    if (e.KeyCode == Keys.ControlKey || e.KeyCode == Keys.ShiftKey ||
+                        e.KeyCode == Keys.Menu || e.KeyCode == Keys.LWin || e.KeyCode == Keys.RWin)
+                        return;
+
+                    int mods = 0;
+                    if (e.Control) mods |= 0x0002;
+                    if (e.Alt) mods |= 0x0001;
+                    if (e.Shift) mods |= 0x0004;
+
+                    captured = new HotkeyBinding { Modifiers = mods, Key = (int)e.KeyCode };
+                    resultLabel.Text = captured.DisplayName;
+                    btnOk.Enabled = true;
+                    e.Handled = true;
+                    e.SuppressKeyPress = true;
+                };
+
+                if (dlg.ShowDialog(this) == DialogResult.OK && captured != null)
+                {
+                    _settings.Hotkeys[profileName] = captured;
+                    _settings.Save();
+                    RegisterProfileHotkeys();
+                    SetStatus("Hotkey " + captured.DisplayName + " set for '" + profileName + "'.");
+                }
+            }
+        }
+
+        private void ShowHotkeyHelp()
+        {
+            var sb = new StringBuilder();
+            sb.AppendLine("Global Hotkeys (work even when minimized):");
+            sb.AppendLine();
+            if (_settings.Hotkeys.Count == 0)
+            {
+                sb.AppendLine("  No hotkeys configured.");
+                sb.AppendLine();
+                sb.AppendLine("  Use the 'Set Hotkey' button in the toolbar");
+                sb.AppendLine("  to assign a key combo to a profile.");
+            }
+            else
+            {
+                foreach (var kvp in _settings.Hotkeys)
+                    sb.AppendLine("  " + kvp.Value.DisplayName + "  ->  " + kvp.Key);
+            }
+            MessageBox.Show(sb.ToString(), "Hotkeys", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        // ---- Lifecycle ----
+
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            RegisterProfileHotkeys();
+        }
+
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
+            UnregisterAllHotkeys();
             foreach (var cam in _cameras)
                 cam.Dispose();
             base.OnFormClosing(e);
