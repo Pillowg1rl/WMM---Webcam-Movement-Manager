@@ -19,7 +19,7 @@ namespace WebcamSettingsManager
 {
     static class AppInfo
     {
-        public const string Version = "1.1.1";
+        public const string Version = "1.2.0";
         public const string GitHubOwner = "Pillowg1rl";
         public const string GitHubRepo = "WMM---Webcam-Movement-Manager";
     }
