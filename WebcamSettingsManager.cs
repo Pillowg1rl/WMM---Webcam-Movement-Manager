@@ -19,7 +19,7 @@ namespace WebcamSettingsManager
 {
     static class AppInfo
     {
-        public const string Version = "2.0.0";
+        public const string Version = "1.1.1";
         public const string GitHubOwner = "Pillowg1rl";
         public const string GitHubRepo = "WMM---Webcam-Movement-Manager";
     }
@@ -648,6 +648,13 @@ namespace WebcamSettingsManager
                 var current = GetCameraControlProperty(p);
                 if (range != null && current != null)
                 {
+                    // Override Roll range — cameras often report too small a range
+                    if (p == CameraControlProperty.Roll)
+                    {
+                        range.Min = -100;
+                        range.Max = 100;
+                    }
+
                     props.Add(new PropertyInfo
                     {
                         Category = "CameraControl",
@@ -1135,6 +1142,232 @@ namespace WebcamSettingsManager
     #endregion
 
     // ========================================================================
+    // JoystickControl - 2D Pan/Tilt joystick widget
+    // ========================================================================
+
+    #region JoystickControl
+
+    // Velocity-style joystick: push to move, snap back to center on release.
+    // The further you push, the faster the camera moves in that direction.
+    class JoystickControl : Panel
+    {
+        private int _panMin, _panMax, _tiltMin, _tiltMax;
+        private bool _dragging;
+        private const int DotSize = 24;
+
+        // Dot position in pixels relative to control's top-left
+        private int _dotX, _dotY;
+        // Center of control
+        private int CenterX { get { return Width / 2; } }
+        private int CenterY { get { return Height / 2; } }
+        // Max distance from center
+        private int MaxRadius { get { return Math.Min(Width, Height) / 2 - DotSize / 2 - 4; } }
+
+        // Direction vector in [-1, 1] (set during drag, zero when idle)
+        private double _dirX, _dirY;
+
+        private System.Windows.Forms.Timer _moveTimer;
+        // Each tick we send EITHER a pan delta OR a tilt delta (alternating)
+        // to avoid the slow PTZ motor cancellation issue
+        private bool _alternateTickIsPan;
+
+        // Tunable parameters (exposed for live testing)
+        // Speed: at full deflection, move this fraction of the range per tick
+        public double MaxSpeedFraction { get; set; }
+        public int DiagonalMinGapMs { get; set; }
+        public int TickIntervalMs
+        {
+            get { return _moveTimer != null ? _moveTimer.Interval : 50; }
+            set { if (_moveTimer != null && value >= 10) _moveTimer.Interval = value; }
+        }
+        private DateTime _lastFireTime = DateTime.MinValue;
+
+        // Fired each tick during drag with deltas to apply (panDelta, tiltDelta)
+        // Either panDelta or tiltDelta is non-zero per call (alternating)
+        public event Action<int, int> MoveStep;
+
+        public JoystickControl(int panMin, int panMax, int tiltMin, int tiltMax)
+        {
+            _panMin = panMin; _panMax = panMax;
+            _tiltMin = tiltMin; _tiltMax = tiltMax;
+
+            Width = 180;
+            Height = 180;
+            BackColor = Color.FromArgb(245, 235, 220);
+            BorderStyle = BorderStyle.FixedSingle;
+            DoubleBuffered = true;
+
+            _dotX = CenterX - DotSize / 2;
+            _dotY = CenterY - DotSize / 2;
+
+            MaxSpeedFraction = 0.020; // 2.0% per tick
+            DiagonalMinGapMs = 20;
+
+            _moveTimer = new System.Windows.Forms.Timer { Interval = 40 };
+            _moveTimer.Tick += OnMoveTick;
+
+            MouseDown += OnMouseDownHandler;
+            MouseMove += OnMouseMoveHandler;
+            MouseUp += OnMouseUpHandler;
+        }
+
+        // No-op for compatibility (joystick is velocity-based, not position-based)
+        public void SetPosition(int pan, int tilt) { }
+
+        private void OnMouseDownHandler(object sender, MouseEventArgs e)
+        {
+            if (e.Button != MouseButtons.Left) return;
+            _dragging = true;
+            Capture = true;
+            UpdateDotFromMouse(e.X, e.Y);
+            _moveTimer.Start();
+        }
+
+        private void OnMouseMoveHandler(object sender, MouseEventArgs e)
+        {
+            if (!_dragging) return;
+            UpdateDotFromMouse(e.X, e.Y);
+        }
+
+        private void OnMouseUpHandler(object sender, MouseEventArgs e)
+        {
+            if (!_dragging) return;
+            _dragging = false;
+            Capture = false;
+            _moveTimer.Stop();
+
+            // Snap dot back to center
+            _dirX = 0;
+            _dirY = 0;
+            _dotX = CenterX - DotSize / 2;
+            _dotY = CenterY - DotSize / 2;
+            Invalidate();
+        }
+
+        private void UpdateDotFromMouse(int mx, int my)
+        {
+            // Vector from center to mouse
+            double dx = mx - CenterX;
+            double dy = my - CenterY;
+
+            // CARDINAL-ONLY MODE: snap to dominant axis (no diagonal movement)
+            // because diagonal jiggles the slow PTZ motors
+            if (Math.Abs(dx) >= Math.Abs(dy))
+                dy = 0;
+            else
+                dx = 0;
+
+            // Clamp to max radius
+            double dist = Math.Sqrt(dx * dx + dy * dy);
+            if (dist > MaxRadius)
+            {
+                double scale = MaxRadius / dist;
+                dx *= scale;
+                dy *= scale;
+            }
+
+            // Normalize direction to [-1, 1]
+            _dirX = dx / MaxRadius;
+            _dirY = -dy / MaxRadius; // invert Y (screen Y grows downward, but tilt+ = up)
+
+            // Update dot position visually
+            _dotX = CenterX + (int)dx - DotSize / 2;
+            _dotY = CenterY + (int)dy - DotSize / 2;
+            Invalidate();
+        }
+
+        private void OnMoveTick(object sender, EventArgs e)
+        {
+            if (_dirX == 0 && _dirY == 0) return;
+            if (MoveStep == null) return;
+
+            // Detect diagonal movement (both axes have meaningful deflection)
+            bool isDiagonal = Math.Abs(_dirX) > 0.1 && Math.Abs(_dirY) > 0.1;
+
+            // Throttle diagonal movement so consecutive Pan/Tilt commands have
+            // a gap big enough for the motor to settle between them
+            if (isDiagonal && (DateTime.Now - _lastFireTime).TotalMilliseconds < DiagonalMinGapMs)
+                return;
+
+            int panDelta = 0, tiltDelta = 0;
+
+            // Apply non-linear curve so small deflections give precise control
+            double curveX = _dirX * Math.Abs(_dirX);
+            double curveY = _dirY * Math.Abs(_dirY);
+
+            if (_alternateTickIsPan)
+            {
+                panDelta = (int)Math.Round((_panMax - _panMin) * MaxSpeedFraction * curveX);
+            }
+            else
+            {
+                tiltDelta = (int)Math.Round((_tiltMax - _tiltMin) * MaxSpeedFraction * curveY);
+            }
+
+            _alternateTickIsPan = !_alternateTickIsPan;
+
+            if (panDelta != 0 || tiltDelta != 0)
+            {
+                _lastFireTime = DateTime.Now;
+                MoveStep(panDelta, tiltDelta);
+            }
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            var g = e.Graphics;
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+
+            int w = Width - 1;
+            int h = Height - 1;
+            int cx = CenterX;
+            int cy = CenterY;
+            int r = MaxRadius;
+
+            // Outer ring (boundary)
+            using (var pen = new Pen(Color.FromArgb(180, 160, 140), 2))
+                g.DrawEllipse(pen, cx - r, cy - r, r * 2, r * 2);
+
+            // Crosshair through center
+            using (var pen = new Pen(Color.FromArgb(200, 180, 160)))
+            {
+                g.DrawLine(pen, cx - r, cy, cx + r, cy);
+                g.DrawLine(pen, cx, cy - r, cx, cy + r);
+            }
+
+            // Center mark
+            using (var brush = new SolidBrush(Color.FromArgb(160, 140, 120)))
+                g.FillEllipse(brush, cx - 3, cy - 3, 6, 6);
+
+            // Line from center to dot (when dragging)
+            if (_dragging)
+            {
+                using (var pen = new Pen(Color.FromArgb(220, 100, 50), 2))
+                    g.DrawLine(pen, cx, cy, _dotX + DotSize / 2, _dotY + DotSize / 2);
+            }
+
+            // Joystick dot
+            using (var brush = new SolidBrush(_dragging ? Color.FromArgb(220, 100, 50) : Color.FromArgb(180, 130, 90)))
+                g.FillEllipse(brush, _dotX, _dotY, DotSize, DotSize);
+            using (var pen = new Pen(Color.FromArgb(140, 60, 30), 2))
+                g.DrawEllipse(pen, _dotX, _dotY, DotSize, DotSize);
+
+            // Direction labels
+            using (var font = new Font(Font.FontFamily, 8, FontStyle.Bold))
+            using (var brush = new SolidBrush(Color.FromArgb(140, 100, 80)))
+            {
+                g.DrawString("Up", font, brush, cx - 8, 2);
+                g.DrawString("Dn", font, brush, cx - 8, h - 14);
+                g.DrawString("L", font, brush, 4, cy - 7);
+                g.DrawString("R", font, brush, w - 12, cy - 7);
+            }
+        }
+    }
+
+    #endregion
+
+    // ========================================================================
     // PropertyRowControl - reusable slider row for one camera property
     // ========================================================================
 
@@ -1256,6 +1489,20 @@ namespace WebcamSettingsManager
             _suppressEvents = false;
         }
 
+        // Set value externally and trigger PropertyChanged (used by joystick)
+        public void SetValueAndApply(int value)
+        {
+            int val = Clamp(value, _propInfo.Range.Min, _propInfo.Range.Max);
+            _suppressEvents = true;
+            _slider.Value = val;
+            _valueBox.Value = val;
+            _suppressEvents = false;
+            if (PropertyChanged != null) PropertyChanged(this);
+        }
+
+        public int Min { get { return _propInfo.Range.Min; } }
+        public int Max { get { return _propInfo.Range.Max; } }
+
         private void OnSliderChanged(object sender, EventArgs e)
         {
             if (_suppressEvents) return;
@@ -1358,7 +1605,76 @@ namespace WebcamSettingsManager
             AddGroup("Video Processing", videoProcProps, Color.FromArgb(240, 240, 250));
             AddGroup("Camera Control", cameraCtrlNonPTZ, Color.FromArgb(240, 250, 240));
             AddGroup("PTZ Controls", ptzProps, Color.FromArgb(255, 245, 230));
+
+            // Add joystick to the PTZ group if Pan AND Tilt are present
+            AddJoystickToPTZ(ptzProps);
         }
+
+        private void AddJoystickToPTZ(List<PropertyInfo> ptzProps)
+        {
+            var panInfo = ptzProps.FirstOrDefault(p => p.Name == "Pan");
+            var tiltInfo = ptzProps.FirstOrDefault(p => p.Name == "Tilt");
+            if (panInfo == null || tiltInfo == null) return;
+
+            // Find the PTZ groupbox we just added (last GroupBox in scrollPanel)
+            GroupBox ptzGroup = null;
+            foreach (Control c in _scrollPanel.Controls)
+            {
+                if (c is GroupBox && ((GroupBox)c).Text == "PTZ Controls")
+                {
+                    ptzGroup = (GroupBox)c;
+                    break;
+                }
+            }
+            if (ptzGroup == null) return;
+
+            var panRow = _rows.FirstOrDefault(r => r.PropertyName == "Pan");
+            var tiltRow = _rows.FirstOrDefault(r => r.PropertyName == "Tilt");
+            if (panRow == null || tiltRow == null) return;
+
+            // Container panel for the joystick (centered)
+            var joyPanel = new Panel
+            {
+                Dock = DockStyle.Top,
+                Height = 200,
+                BackColor = Color.Transparent
+            };
+
+            var joystick = new JoystickControl(panRow.Min, panRow.Max, tiltRow.Min, tiltRow.Max);
+            joystick.Anchor = AnchorStyles.Top;
+
+            joystick.MoveStep += (panDelta, tiltDelta) =>
+            {
+                if (panDelta != 0)
+                    panRow.SetValueAndApply(panRow.CurrentValue + panDelta);
+                if (tiltDelta != 0)
+                    tiltRow.SetValueAndApply(tiltRow.CurrentValue + tiltDelta);
+            };
+
+            joyPanel.Controls.Add(joystick);
+
+            // Center horizontally
+            joyPanel.Resize += (s, e) =>
+                joystick.Left = (joyPanel.Width - joystick.Width) / 2;
+            joystick.Top = 5;
+            joystick.Left = (joyPanel.Width - joystick.Width) / 2;
+
+            // Insert at the top of the PTZ group's inner panel
+            if (ptzGroup.Controls.Count > 0)
+            {
+                var innerPanel = ptzGroup.Controls[0] as Panel;
+                if (innerPanel != null)
+                    innerPanel.Controls.Add(joyPanel);
+            }
+
+            _ptzJoystick = joystick;
+            _ptzPanRow = panRow;
+            _ptzTiltRow = tiltRow;
+        }
+
+        private JoystickControl _ptzJoystick;
+        private PropertyRowControl _ptzPanRow;
+        private PropertyRowControl _ptzTiltRow;
 
         private void AddGroup(string title, List<PropertyInfo> props, Color bgColor)
         {
@@ -1427,6 +1743,10 @@ namespace WebcamSettingsManager
 
                 row.UpdateFromDevice(pv);
             }
+
+            // Sync joystick position with current Pan/Tilt
+            if (_ptzJoystick != null && _ptzPanRow != null && _ptzTiltRow != null)
+                _ptzJoystick.SetPosition(_ptzPanRow.CurrentValue, _ptzTiltRow.CurrentValue);
         }
     }
 
@@ -1454,13 +1774,10 @@ namespace WebcamSettingsManager
         private AppSettings _settings;
         private ToolStripMenuItem _darkModeItem;
 
-        // Undo
-        private Dictionary<string, ProfileDevice> _undoState;
-        private ToolStripButton _undoBtn;
-
         // Profile notes
         private Label _notesLabel;
         private Panel _profileInfoPanel;
+        private bool _suppressProfileChange;
 
         // Global hotkeys
         private List<string> _hotkeyProfiles = new List<string>();
@@ -1543,32 +1860,21 @@ namespace WebcamSettingsManager
 
             _toolbar.Items.Add(new ToolStripButton("Refresh", null, (s, e) => RefreshDevices()) { ToolTipText = "Re-enumerate cameras" });
             _toolbar.Items.Add(new ToolStripSeparator());
-            _toolbar.Items.Add(new ToolStripButton("Save All", null, (s, e) => SaveProfile(true)) { ToolTipText = "Save all cameras to profile" });
-            _toolbar.Items.Add(new ToolStripButton("Save Selected", null, (s, e) => SaveProfile(false)) { ToolTipText = "Save current camera to profile" });
+            _toolbar.Items.Add(new ToolStripButton("Save", null, (s, e) => SaveProfile(false)) { ToolTipText = "Save current settings to profile" });
             _toolbar.Items.Add(new ToolStripSeparator());
-            _toolbar.Items.Add(new ToolStripButton("Restore All", null, (s, e) => RestoreProfile(true)) { ToolTipText = "Restore all cameras from profile" });
-            _toolbar.Items.Add(new ToolStripButton("Restore Selected", null, (s, e) => RestoreProfile(false)) { ToolTipText = "Restore current camera from profile" });
-            _toolbar.Items.Add(new ToolStripSeparator());
-
-            var profileLabel = new ToolStripLabel("Profile:");
-            _toolbar.Items.Add(profileLabel);
 
             _profileCombo = new ComboBox
             {
-                Width = 180,
+                Width = 150,
                 DropDownStyle = ComboBoxStyle.DropDownList
             };
+            _profileCombo.SelectedIndexChanged += (s, e) => OnProfileSelected();
             _toolbar.Items.Add(new ToolStripControlHost(_profileCombo));
 
             _toolbar.Items.Add(new ToolStripButton("Delete", null, (s, e) => DeleteProfile()) { ToolTipText = "Delete selected profile" });
+            _toolbar.Items.Add(new ToolStripSeparator());
             _toolbar.Items.Add(new ToolStripButton("Generate .bat", null, (s, e) => GenerateBat()) { ToolTipText = "Generate a .bat file to restore this profile" });
             _toolbar.Items.Add(new ToolStripButton("Set Hotkey", null, (s, e) => SetHotkeyForProfile()) { ToolTipText = "Assign a global hotkey to restore this profile" });
-            _toolbar.Items.Add(new ToolStripSeparator());
-            _undoBtn = new ToolStripButton("Undo", null, (s, e) => PerformUndo());
-            _undoBtn.ToolTipText = "Undo last restore";
-            _undoBtn.Enabled = false;
-            _toolbar.Items.Add(_undoBtn);
-
             Controls.Add(_toolbar);
         }
 
@@ -1603,7 +1909,6 @@ namespace WebcamSettingsManager
 
             Controls.Add(_profileInfoPanel);
 
-            _profileCombo.SelectedIndexChanged += (s, e) => UpdateProfileInfo();
         }
 
         private void BuildTabControl()
@@ -1689,11 +1994,14 @@ namespace WebcamSettingsManager
 
         private void RefreshProfileList()
         {
+            _suppressProfileChange = true;
             _profileCombo.Items.Clear();
             foreach (var name in _profileMgr.ListProfiles())
                 _profileCombo.Items.Add(name);
             if (_profileCombo.Items.Count > 0)
                 _profileCombo.SelectedIndex = 0;
+            _suppressProfileChange = false;
+            UpdateProfileInfo();
         }
 
         private void SaveProfile(bool allDevices)
@@ -1718,13 +2026,11 @@ namespace WebcamSettingsManager
                 if (result == DialogResult.Yes)
                 {
                     name = existing;
-                    // Keep existing notes
                     var existingProfile = _profileMgr.LoadProfile(name);
                     if (existingProfile != null) notes = existingProfile.Notes ?? "";
                 }
             }
 
-            // If not overwriting, prompt for new name
             if (name == null)
             {
                 name = PromptProfileName(out notes);
@@ -1733,79 +2039,19 @@ namespace WebcamSettingsManager
 
             try
             {
-                string filter = null;
-                if (!allDevices)
-                {
-                    var selectedTab = _tabControl.SelectedTab as CameraTabPage;
-                    if (selectedTab != null)
-                        filter = selectedTab.Camera.DevicePath;
-                }
-
-                _profileMgr.SaveProfile(name, _cameras, filter, notes);
+                _profileMgr.SaveProfile(name, _cameras, null, notes);
+                _suppressProfileChange = true;
                 RefreshProfileList();
-                RegisterProfileHotkeys();
-
                 int idx = _profileCombo.Items.IndexOf(name);
                 if (idx >= 0) _profileCombo.SelectedIndex = idx;
+                _suppressProfileChange = false;
+                RegisterProfileHotkeys();
 
-                SetStatus("Saved profile: " + name + (allDevices ? " (all cameras)" : " (selected camera)"));
+                SetStatus("Saved profile: " + name);
             }
             catch (Exception ex)
             {
                 MessageBox.Show("Error saving profile: " + ex.Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-        }
-
-        private void RestoreProfile(bool allDevices)
-        {
-            if (_cameras.Count == 0)
-            {
-                MessageBox.Show("No cameras available.", "Restore Profile", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
-
-            if (_profileCombo.SelectedItem == null)
-            {
-                MessageBox.Show("Please select a profile first.", "Restore Profile", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
-
-            string name = _profileCombo.SelectedItem.ToString();
-
-            try
-            {
-                string filter = null;
-                if (!allDevices)
-                {
-                    var selectedTab = _tabControl.SelectedTab as CameraTabPage;
-                    if (selectedTab != null)
-                        filter = selectedTab.Camera.DevicePath;
-                }
-
-                // Snapshot current state for undo
-                _undoState = SnapshotCurrentState(_cameras, filter);
-                _undoBtn.Enabled = true;
-
-                SetStatus("Restoring profile '" + name + "'... (PTZ motors may take a moment)");
-                Cursor = Cursors.WaitCursor;
-                Application.DoEvents();
-
-                var errors = _profileMgr.ApplyProfile(name, _cameras, filter);
-
-                Cursor = Cursors.Default;
-
-                // Refresh all slider positions
-                foreach (var tab in _cameraTabs)
-                    tab.RefreshFromDevice();
-
-                if (errors.Count > 0)
-                    SetStatus("Restored with " + errors.Count + " warning(s): " + string.Join(", ", errors.Take(3)));
-                else
-                    SetStatus("Restored profile: " + name + (allDevices ? " (all cameras)" : " (selected camera)"));
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show("Error restoring profile: " + ex.Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
 
@@ -2147,6 +2393,40 @@ namespace WebcamSettingsManager
 
         // ---- Profile Info Panel ----
 
+        private void OnProfileSelected()
+        {
+            if (_suppressProfileChange) return;
+            UpdateProfileInfo();
+
+            // Auto-restore when switching profiles
+            if (_profileCombo.SelectedItem == null || _cameras.Count == 0) return;
+
+            string name = _profileCombo.SelectedItem.ToString();
+            try
+            {
+                SetStatus("Switching to profile '" + name + "'...");
+                Cursor = Cursors.WaitCursor;
+                Application.DoEvents();
+
+                var errors = _profileMgr.ApplyProfile(name, _cameras);
+
+                Cursor = Cursors.Default;
+
+                foreach (var tab in _cameraTabs)
+                    tab.RefreshFromDevice();
+
+                if (errors.Count > 0)
+                    SetStatus("Profile '" + name + "': " + errors.Count + " warning(s)");
+                else
+                    SetStatus("Switched to profile: " + name);
+            }
+            catch (Exception ex)
+            {
+                Cursor = Cursors.Default;
+                SetStatus("Error: " + ex.Message);
+            }
+        }
+
         private void UpdateProfileInfo()
         {
             if (_profileCombo.SelectedItem == null)
@@ -2161,60 +2441,6 @@ namespace WebcamSettingsManager
                 _notesLabel.Text = profile.Notes;
             else
                 _notesLabel.Text = "(no notes)";
-        }
-
-        // ---- Undo ----
-
-        private Dictionary<string, ProfileDevice> SnapshotCurrentState(List<CameraDevice> cameras, string devicePathFilter)
-        {
-            var snapshot = new Dictionary<string, ProfileDevice>();
-            foreach (var cam in cameras)
-            {
-                if (devicePathFilter != null && cam.DevicePath != devicePathFilter) continue;
-                var dev = new ProfileDevice { FriendlyName = cam.FriendlyName };
-                foreach (var prop in cam.GetAllProperties())
-                {
-                    var pp = new ProfileProperty { Value = prop.Current.Value, Flags = prop.Current.Flags };
-                    if (prop.Category == "VideoProcAmp")
-                        dev.VideoProcAmp[prop.Name] = pp;
-                    else
-                        dev.CameraControl[prop.Name] = pp;
-                }
-                snapshot[cam.DevicePath] = dev;
-            }
-            return snapshot;
-        }
-
-        private void PerformUndo()
-        {
-            if (_undoState == null || _undoState.Count == 0)
-            {
-                MessageBox.Show("Nothing to undo.", "Undo", MessageBoxButtons.OK, MessageBoxIcon.Information);
-                return;
-            }
-
-            SetStatus("Undoing last restore...");
-            Cursor = Cursors.WaitCursor;
-            Application.DoEvents();
-
-            var errors = new List<string>();
-            foreach (var cam in _cameras)
-            {
-                ProfileDevice dev;
-                if (_undoState.TryGetValue(cam.DevicePath, out dev))
-                    errors.AddRange(cam.ApplyProperties(dev));
-            }
-
-            Cursor = Cursors.Default;
-            foreach (var tab in _cameraTabs) tab.RefreshFromDevice();
-
-            _undoState = null;
-            _undoBtn.Enabled = false;
-
-            if (errors.Count == 0)
-                SetStatus("Undo complete.");
-            else
-                SetStatus("Undo done with " + errors.Count + " warning(s).");
         }
 
         // ---- Global Hotkeys ----
@@ -2247,9 +2473,6 @@ namespace WebcamSettingsManager
                 if (id >= 0 && id < _hotkeyProfiles.Count)
                 {
                     string profileName = _hotkeyProfiles[id];
-                    _undoState = SnapshotCurrentState(_cameras, null);
-                    _undoBtn.Enabled = true;
-
                     var errors = _profileMgr.ApplyProfile(profileName, _cameras);
                     foreach (var tab in _cameraTabs) tab.RefreshFromDevice();
 
@@ -2393,6 +2616,45 @@ namespace WebcamSettingsManager
         {
             base.OnShown(e);
             RegisterProfileHotkeys();
+            CheckForUpdatesSilent();
+        }
+
+        private void CheckForUpdatesSilent()
+        {
+            // Run on a background thread so startup isn't blocked
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    string apiUrl = "https://api.github.com/repos/" + AppInfo.GitHubOwner + "/" + AppInfo.GitHubRepo + "/releases/latest";
+                    ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+                    var request = (HttpWebRequest)WebRequest.Create(apiUrl);
+                    request.UserAgent = "WebcamSettingsManager/" + AppInfo.Version;
+                    request.Accept = "application/json";
+                    request.Timeout = 5000;
+
+                    string json;
+                    using (var response = (HttpWebResponse)request.GetResponse())
+                    using (var reader = new StreamReader(response.GetResponseStream()))
+                        json = reader.ReadToEnd();
+
+                    string tagName = ExtractJsonString(json, "tag_name");
+                    string remoteVer = (tagName ?? "").TrimStart('v', 'V');
+                    if (!string.IsNullOrEmpty(remoteVer) && remoteVer != AppInfo.Version)
+                    {
+                        BeginInvoke(new Action(delegate
+                        {
+                            SetStatus("Update available: " + tagName);
+                            var result = MessageBox.Show(
+                                "A new version (" + tagName + ") is available.\n\nWould you like to open the update dialog?",
+                                "Update Available", MessageBoxButtons.YesNo, MessageBoxIcon.Information);
+                            if (result == DialogResult.Yes)
+                                CheckForUpdates();
+                        }));
+                    }
+                }
+                catch { }
+            });
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
